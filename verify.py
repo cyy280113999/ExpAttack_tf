@@ -1,10 +1,11 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
 import tensorflow as tf
 import numpy as np
 import argparse
 import utils
 import csv
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 model_names=['inception_v3','inception_v4','inception_resnet_v2','resnet_v1_50','resnet_v1_152',
              'resnet_v2_50','resnet_v2_152','vgg_16','vgg_19','adv_inception_v3','adv_inception_resnet_v2',
@@ -29,7 +30,7 @@ def verify(model_name,ori_image_path,adv_image_path):
     image_preprocessing_fn = utils.normalization_fn_map[model_name]
     image_size = utils.image_size[model_name]
 
-    batch_size=200
+    batch_size=8
     image_ph=tf.placeholder(dtype=tf.float32,shape=[batch_size,image_size,image_size,3])
 
     logits, _ = network_fn(image_ph)
@@ -67,17 +68,22 @@ def verify(model_name,ori_image_path,adv_image_path):
     return ori_pre,adv_pre,ground_truth
 
 
-def main(ori_path='./dataset/images/',adv_path='./adv/',output_file='./log.csv'):
+def eval(adv_path='./adv/',output_file='./log.csv'):
     ori_accuracys=[]
     adv_accuracys=[]
     adv_successrates=[]
+    ans=[]
+    if not os.path.exists(output_file):  # header
+        with open(output_file,'a+',newline='') as f:
+            writer=csv.writer(f)
+            writer.writerow(['name']+model_names)
     with open(output_file,'a+',newline='') as f:
         writer=csv.writer(f)
-        writer.writerow([adv_path])
-        writer.writerow(model_names)
+        # writer.writerow([adv_path])
+        # writer.writerow(model_names)
         for model_name in model_names:
             print(model_name)
-            ori_pre,adv_pre,ground_truth=verify(model_name,ori_path,adv_path)
+            ori_pre,adv_pre,ground_truth=verify(model_name,'dataset/images/',adv_path)
             ori_accuracy = np.sum(ori_pre == ground_truth)/1000
             adv_accuracy = np.sum(adv_pre == ground_truth)/1000
             adv_successrate = np.sum(ori_pre != adv_pre)/1000
@@ -88,14 +94,20 @@ def main(ori_path='./dataset/images/',adv_path='./adv/',output_file='./log.csv')
             adv_successrates.append('{:.1%}'.format(adv_successrate))
         # print(adv_successrates)
         # writer.writerow(ori_accuracys)
-        writer.writerow(adv_successrates)
+        # writer.writerow(adv_successrates)
         # writer.writerow(adv_accuracys)
+        # exp_name = os.path.split
+        name = adv_path
+        name = name + ' '*(30-len(name))
+        ans.append(name)
+        ans.extend(adv_successrates)
+        writer.writerow(ans)
+        print(f'save {name}')
 
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser()
-    parser.add_argument('--ori_path', default='./dataset/images/')
     parser.add_argument('--adv_path',default='./adv/FIA/')
     parser.add_argument('--output_file', default='./log.csv')
     args=parser.parse_args()
-    main(args.ori_path,args.adv_path,args.output_file)
+    eval(args.adv_path,args.output_file)

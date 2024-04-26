@@ -1,31 +1,29 @@
 """Implementation of attack."""
 # coding: utf-8
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.utils import to_categorical
-# import time
+import time
 import utils
 import os
-# from scipy import misc
-# from scipy import ndimage
-# import PIL
-# import io
-
+from scipy import misc
+from scipy import ndimage
+import PIL
+import io
 
 slim = tf.contrib.slim
 
-tf.flags.DEFINE_string('model_name', 'inception_v3', 'The Model used to generate adv.')
 
-tf.flags.DEFINE_string('attack_method', 'NAA', 'The name of attack method.')
 
-tf.flags.DEFINE_string('layer_name','InceptionV3/InceptionV3/Mixed_5b/concat','The layer to be attacked.')
+tf.flags.DEFINE_string('model_name', 'vgg_16', 'The Model used to generate adv.')
+
+tf.flags.DEFINE_string('attack_method', 'FMAA', 'The name of attack method.')
+
+tf.flags.DEFINE_string('layer_name','vgg_16/conv3/conv3_3/Relu','The layer to be attacked.')
 
 tf.flags.DEFINE_string('input_dir', './dataset/images/', 'Input directory with images.')
 
-tf.flags.DEFINE_string('output_dir', './adv/NAA/', 'Output directory with images.')
+tf.flags.DEFINE_string('output_dir', './adv/FMAA/', 'Output directory with images.')
 
 tf.flags.DEFINE_float('max_epsilon', 16.0, 'Maximum size of adversarial perturbation.')
 
@@ -33,16 +31,21 @@ tf.flags.DEFINE_integer('num_iter', 10, 'Number of iterations.')
 
 tf.flags.DEFINE_float('alpha', 1.6, 'Step size.')
 
-tf.flags.DEFINE_integer('batch_size', 20, 'How many images process at one time.')
+tf.flags.DEFINE_integer('batch_size', 8, 'How many images process at one time.')
 
 tf.flags.DEFINE_float('momentum', 1.0, 'Momentum.')
 
 tf.flags.DEFINE_string('GPU_ID', '0', 'which GPU to use.')
 
-"""parameter for DIM"""
-tf.flags.DEFINE_integer('image_size', 299, 'size of each input images.')
+"""parameter for VIM"""
+tf.flags.DEFINE_integer('vn', 20, 'the number of images for variance tuning')
 
-tf.flags.DEFINE_integer('image_resize', 331, 'size of each diverse images.')
+tf.flags.DEFINE_float('vb', 1.5, 'the bound for variance tuning.')
+
+"""parameter for DIM"""
+tf.flags.DEFINE_integer('image_size', 224, 'size of each input images.')
+
+tf.flags.DEFINE_integer('image_resize', 250, 'size of each diverse images.')
 
 tf.flags.DEFINE_float('prob', 0.7, 'Probability of using diverse inputs.')
 
@@ -56,19 +59,22 @@ tf.flags.DEFINE_float('gamma', 0.5, 'The gamma parameter.')
 
 tf.flags.DEFINE_integer('Pkern_size', 3, 'Kernel size of PIM.')
 
-"""parameter for NAA"""
-tf.flags.DEFINE_float('ens', 30.0, 'Aggregated N for NAA or Mask number for FIA.')
-"""parameter for FIA"""
-tf.flags.DEFINE_float('probb', 0.9, 'keep probability = 1 - drop probability.')
+"""parameter for FMAA"""
+tf.flags.DEFINE_float('ens', 30.0, 'Number of random mask input for ori image.')
+tf.flags.DEFINE_float('ens2', 30.0, 'Number of random mask input during iterations, set as `-1` to use FIA')
+tf.flags.DEFINE_float('probb', 0.6, 'keep probability = 1 - drop probability.')
+tf.flags.DEFINE_float('probb2', 0.9, 'keep probability2 = 1 - drop probability2, which is used during iterations.')
+tf.flags.DEFINE_float('beta', 1.1, 'The momentum weight during iterations.')
 
 FLAGS = tf.flags.FLAGS
 os.environ["CUDA_VISIBLE_DEVICES"] = FLAGS.GPU_ID
+FLAGS.image_size = utils.image_size[FLAGS.model_name]
 
 """obtain the feature map of the target layer"""
 def get_opt_layers(layer_name):
     opt_operations = []
-    #shape=[FLAGS.batch_size,FLAGS.image_size,FLAGS.image_size,3]
     operations = tf.get_default_graph().get_operations()
+    
     for op in operations:
         if layer_name == op.name:
             opt_operations.append(op.outputs[0])
@@ -102,36 +108,14 @@ def get_nrdm_loss(opt_operations):
     loss = loss / len(opt_operations)
     return loss
 
-"""the loss function for FIA"""
-def get_fia_loss(opt_operations,weights):
+"""the loss function for FMAA"""
+def get_fmaa_loss(opt_operations,weights):
     loss = 0
     for layer in opt_operations:
         ori_tensor = layer[:FLAGS.batch_size]
         adv_tensor = layer[FLAGS.batch_size:]
-        loss += tf.reduce_sum(adv_tensor*weights) / tf.cast(tf.size(layer), tf.float32)
-
-    loss = loss / len(opt_operations)
-    return loss
-
-"""the loss function for NAA"""
-def get_NAA_loss(opt_operations,weights,base_feature):
-    loss = 0
-    gamma = 1.0
-    for layer in opt_operations:
-        ori_tensor = layer[:FLAGS.batch_size]
-        adv_tensor = layer[FLAGS.batch_size:]
-        attribution = (adv_tensor-base_feature)*weights
-        #attribution = (adv_tensor)*weights
-        blank = tf.zeros_like(attribution)
-        positive = tf.where(attribution >= 0, attribution, blank)
-        negative = tf.where(attribution < 0, attribution, blank)
-        ## Transformation: Linear transformation performs the best
-        positive = positive
-        negative = negative
-        ##
-        balance_attribution = positive + gamma*negative
-        loss += tf.reduce_sum(balance_attribution) / tf.cast(tf.size(layer), tf.float32)
         
+        loss += tf.reduce_sum(adv_tensor * weights ) / tf.cast(tf.size(layer), tf.float32)
     loss = loss / len(opt_operations)
     return loss
 
@@ -189,9 +173,10 @@ def input_diversity(input_tensor):
     return ret
 
 P_kern, kern_size = project_kern(FLAGS.Pkern_size)
-
+T_kern = gkern(FLAGS.Tkern_size)
 
 def main(_):
+
     if FLAGS.model_name in ['vgg_16','vgg_19', 'resnet_v1_50','resnet_v1_152']:
         eps = FLAGS.max_epsilon
         alpha = FLAGS.alpha
@@ -216,10 +201,13 @@ def main(_):
         label_ph = tf.placeholder(tf.float32, shape=[FLAGS.batch_size*2,num_classes])
         accumulated_grad_ph = tf.placeholder(dtype=tf.float32, shape=batch_shape)
         amplification_ph = tf.placeholder(dtype=tf.float32, shape=batch_shape)
-
         network_fn = utils.nets_factory.get_network_fn(FLAGS.model_name, num_classes=num_classes, is_training=False)
         x=tf.concat([ori_input,adv_input],axis=0)
-
+        
+        V_ph = tf.placeholder(tf.float32, shape=batch_shape)
+        grad_v_ph = tf.placeholder(dtype=tf.float32, shape=batch_shape)
+        gradient_ph = tf.placeholder(dtype=tf.float32, shape=batch_shape)
+        
         # whether using DIM or not
         if 'DI' in FLAGS.attack_method:
             logits, end_points = network_fn(input_diversity(x))
@@ -234,27 +222,32 @@ def main(_):
 
         opt_operations,shape = get_opt_layers(layer_name)
         weights_ph = tf.placeholder(dtype=tf.float32, shape=shape)
-        base_feature = tf.placeholder(dtype=tf.float32, shape=shape)
 
         # select the loss function
         if 'FDA' in FLAGS.attack_method:
             loss = get_fda_loss(opt_operations)
         elif 'NRDM' in FLAGS.attack_method:
             loss = get_nrdm_loss(opt_operations)
-        elif 'FIA' in FLAGS.attack_method:
+        elif 'FMAA' in FLAGS.attack_method:
             weights_tensor = tf.gradients(logits * label_ph, opt_operations[0])[0]
-            loss = get_fia_loss(opt_operations,weights_ph)  # argmin
-        elif 'NAA' in FLAGS.attack_method:
-            weights_tensor = tf.gradients(tf.nn.softmax(logits) * label_ph, opt_operations[0])[0]
-            loss = get_NAA_loss(opt_operations,weights_ph,base_feature)
+            loss = get_fmaa_loss(opt_operations,weights_ph)
         else:
-            loss = entropy_loss  # argmax
+            loss = entropy_loss
 
         gradient=tf.gradients(loss,adv_input)[0]
-
-        noise = gradient
+        
+        noise = gradient_ph
         adv_input_update = adv_input
         amplification_update = amplification_ph
+        V_update = V_ph
+        # whether use VIM or not
+        if 'VI' in FLAGS.attack_method:
+            V_update = grad_v_ph / (1. * FLAGS.vn) - noise
+            noise = noise + V_ph
+        
+        # whether using TIM or not
+        if 'TI' in FLAGS.attack_method:
+            noise = tf.nn.depthwise_conv2d(noise, T_kern, strides=[1, 1, 1, 1], padding='SAME')
 
         # the default optimization process with momentum
         noise = noise / tf.reduce_mean(tf.abs(noise), [1, 2, 3], keep_dims=True)
@@ -272,30 +265,28 @@ def main(_):
             projection = gamma * tf.sign(project_noise(cut_noise, P_kern, kern_size))
 
             amplification_update += projection
-
             adv_input_update = adv_input_update + alpha_beta * tf.sign(noise) + projection
         else:
-            adv_input_update = adv_input_update + alpha * tf.sign(noise)  # maximize
+            adv_input_update = adv_input_update + alpha * tf.sign(noise)
 
 
         saver=tf.train.Saver()
         with tf.Session() as sess:
+            #tf.get_default_graph()
             saver.restore(sess,checkpoint_path)
             count=0
             for images,names,labels in utils.load_image(FLAGS.input_dir, FLAGS.image_size,FLAGS.batch_size):
+                
                 count+=FLAGS.batch_size
                 if count%100==0:
-                    print("Generating:",count)
-
+                    print("Generating:",names,count)
                 images_tmp=image_preprocessing_fn(np.copy(images))
                 if FLAGS.model_name in ['resnet_v1_50','resnet_v1_152','vgg_16','vgg_19']:
                     labels=labels-1
-
+                
                 # obtain true label
-                labels= to_categorical(np.concatenate([labels,labels],axis=-1),num_classes)
-                #labels = sess.run(one_hot, feed_dict={ori_input: images_tmp, adv_input: images_tmp})
-
-                #add some noise to avoid F_{k}(x)-F_{k}(x')=0
+                labels = to_categorical(np.concatenate([labels,labels],axis=-1),num_classes)
+                
                 if 'NRDM' in FLAGS.attack_method:
                     images_adv=images+np.random.normal(0,0.1,size=np.shape(images))
                 else:
@@ -306,47 +297,79 @@ def main(_):
                 grad_np=np.zeros(shape=batch_shape)
                 amplification_np=np.zeros(shape=batch_shape)
                 weight_np = np.zeros(shape=shape)
-
+                V_np = np.zeros(shape=batch_shape)
+                
                 for i in range(num_iter):
-                    if i == 0:
-                        images_base = np.zeros_like(images)
-                        images_base = image_preprocessing_fn(images_base)
-                            
-                        feature_base = sess.run([opt_operations[0]],
-                                            feed_dict={ori_input: images_base, adv_input: images_base,label_ph: labels})
-                        feature_base = feature_base[0][:FLAGS.batch_size]
-                        if 'FIA' in FLAGS.attack_method:
+                    #print(i)
+                    grad_global_np = np.zeros(shape=batch_shape)
+                    # calculate the weights(feature importance) for FMAA
+                    if 'FMAA' in FLAGS.attack_method:
+                        if i == 0:
+                            # only use original image to obtain weights
+                            if FLAGS.ens == 0:
+                                images_tmp2 = image_preprocessing_fn(np.copy(images))
+
+                                w, feature = sess.run([weights_tensor, opt_operations[0]],
+                                                      feed_dict={ori_input: images_tmp2, adv_input: images_tmp2,label_ph: labels})
+                                weight_np = w[:FLAGS.batch_size]
+                                
+                            # use ensemble masked image to obtain weights
                             for l in range(int(FLAGS.ens)):
                                 mask = np.random.binomial(1, FLAGS.probb, size=(batch_shape[0],batch_shape[1],batch_shape[2],batch_shape[3]))
                                 images_tmp2 = images * mask
                                 images_tmp2 = image_preprocessing_fn(np.copy(images_tmp2))
-                                w, feature = sess.run([weights_tensor, opt_operations[0]],feed_dict={ori_input: images_tmp2, adv_input: images_tmp2, label_ph: labels})
+
+                                w, feature = sess.run([weights_tensor, opt_operations[0]],
+                                                      feed_dict={ori_input: images_tmp2, adv_input: images_tmp2,label_ph: labels})
                                 weight_np = weight_np + w[:FLAGS.batch_size]
-
-                            weight_np = -normalize(weight_np, 2)
-
-                        if 'NAA' in FLAGS.attack_method:
-                            for l in range(int(FLAGS.ens)):
-                                x_base = np.array([0.0,0.0,0.0])
-                                x_base = image_preprocessing_fn(x_base)
-                                images_tmp2 = image_preprocessing_fn(np.copy(images))
-                                images_tmp2 += np.random.normal(size = images.shape, loc=0.0, scale=0.2)
-                                images_tmp2 = images_tmp2*(1 - l/FLAGS.ens)+ (l/FLAGS.ens)*x_base
-                                w, feature = sess.run([weights_tensor, opt_operations[0]],feed_dict={ori_input: images_tmp2, adv_input: images_tmp2, label_ph: labels})
-                                weight_np = weight_np + w[:FLAGS.batch_size]
-
                             # normalize the weights
-                            weight_np = -normalize(weight_np, 2)
+                            weight_np = normalize(weight_np, 1)
+                            last_weight = np.copy(weight_np)
 
-
-                    # optimization
+                        # update iterative gradient map
+                        elif int(FLAGS.ens2) != -1:
+                            # if FLAGS.ens2 == -1, then FIA is adopted 
+                            weight_np = np.zeros(shape=shape)
+                            if FLAGS.ens2 == 0:
+                                images_tmp2 = np.copy(images_adv)
+                                
+                                w, feature = sess.run([weights_tensor, opt_operations[0]],
+                                                      feed_dict={ori_input: images_tmp2, adv_input: images_tmp2,label_ph: labels})
+                                weight_np = w[:FLAGS.batch_size]
+                            for l in range(int(FLAGS.ens2)):
+                                # generate the random mask
+                                mask = np.random.binomial(1, FLAGS.probb2, size=(batch_shape[0],batch_shape[1],batch_shape[2],batch_shape[3]))
+                                images_tmp2 = inv_image_preprocessing_fn(images_adv) * mask
+                                images_tmp2 = image_preprocessing_fn(np.copy(images_tmp2))
+                                
+                                w, feature = sess.run([weights_tensor, opt_operations[0]],feed_dict={ori_input: images_tmp2, adv_input: images_tmp2, label_ph: labels})
+                                weight_np = weight_np + w[:FLAGS.batch_size]
+                                
+                            # normalize the weights
+                            weight_np = normalize(weight_np, 1)
+                            weight_np = FLAGS.beta * last_weight + weight_np
+                            last_weight = np.copy(weight_np)
+                    
+                    grad_v_np = sess.run([gradient], feed_dict={ori_input:images_adv,adv_input:images_adv,weights_ph:-normalize(weight_np, 2),
+                                    label_ph:labels})[0]
+                    
+                    # if VIM used
+                    if 'VI' in FLAGS.attack_method:
+                        for _ in range(FLAGS.vn):
+                            images_adv_neighbor = np.copy(images_adv) + np.random.uniform(low=-eps*FLAGS.beta, high=eps*FLAGS.beta, size=(batch_shape[0],batch_shape[1],batch_shape[2],batch_shape[3]))
+                            grad_global_np += sess.run([gradient],
+                                    feed_dict={ori_input:images_tmp,adv_input:images_adv_neighbor,weights_ph:-normalize(weight_np, 2),
+                                    label_ph:labels})[0]
+                        V_np = sess.run([V_update], feed_dict={grad_v_ph:grad_global_np, gradient_ph:grad_v_np})[0]
+                        
+                    
                     images_adv, grad_np, amplification_np=sess.run([adv_input_update, noise, amplification_update],
-                                              feed_dict={ori_input:images_tmp,adv_input:images_adv,weights_ph:weight_np, base_feature:feature_base,
-                                                         label_ph:labels,accumulated_grad_ph:grad_np,amplification_ph:amplification_np})
+                                              feed_dict={grad_v_ph:grad_global_np,V_ph:V_np, ori_input:images_tmp,adv_input:images_adv,weights_ph:-normalize(weight_np, 2),
+                                                         label_ph:labels,accumulated_grad_ph:grad_np,amplification_ph:amplification_np, gradient_ph:grad_v_np})
                     images_adv = np.clip(images_adv, images_tmp - eps, images_tmp + eps)
-
+                    
                 images_adv = inv_image_preprocessing_fn(images_adv)
                 utils.save_image(images_adv, names, FLAGS.output_dir)
-
+                    
 if __name__ == '__main__':
     tf.app.run()

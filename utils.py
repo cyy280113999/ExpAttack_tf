@@ -5,21 +5,22 @@ from scipy.misc import imresize,imread,imsave
 from PIL import Image
 import tensorflow as tf
 from nets import inception_v3, inception_v4, inception_resnet_v2, resnet_v2, resnet_v1, vgg, nets_factory
-
+from config import *
 slim = tf.contrib.slim
 
-
+# input image in [0,255]
+# shift only
 def vgg_normalization(image):
-  return image - [123.68, 116.78, 103.94]
-
+    return image - [123.68, 116.78, 103.94]
+# scale to [-1,1]
 def inception_normalization(image):
-  return ((image / 255.) - 0.5) * 2
+    return ((image / 255.) - 0.5) * 2
 
 def inv_vgg_normalization(image):
-  return np.clip(image + [123.68, 116.78, 103.94],0,255)
+    return np.clip(image + [123.68, 116.78, 103.94],0,255)
 
 def inv_inception_normalization(image):
-  return np.clip((image + 1.0) * 0.5 * 255,0,255)
+    return np.clip((image + 1.0) * 0.5 * 255,0,255)
 
 normalization_fn_map = {
     'inception_v1': inception_normalization,
@@ -57,6 +58,7 @@ inv_normalization_fn_map = {
     'vgg_19': inv_vgg_normalization,
 }
 
+# label offset. for example, inc model add one neuron in output layer.
 offset = {
     'inception_v1': 1,
     'inception_v2': 1,
@@ -73,7 +75,7 @@ offset = {
     'resnet_v2_200': 1,
     'vgg_16': 0,
     'vgg_19': 0,
-  }
+}
 
 image_size={
     'inception_v1': 299,
@@ -91,9 +93,9 @@ image_size={
     'resnet_v2_200': 299,
     'vgg_16': 224,
     'vgg_19': 224,
-  }
-base_path='./models_tf'
+}
 
+# set up 'base_path' in config file.
 checkpoint_paths = {
     'inception_v1': None,
     'inception_v2': None,
@@ -115,13 +117,12 @@ checkpoint_paths = {
     'ens3_adv_inception_v3':base_path+'/ens3_adv_inception_v3/ens3_adv_inception_v3.ckpt',
     'ens4_adv_inception_v3':base_path+'/ens4_adv_inception_v3/ens4_adv_inception_v3.ckpt',
     'ens_adv_inception_resnet_v2':base_path+'/ens_adv_inception_resnet_v2/ens_adv_inception_resnet_v2.ckpt'
-  }
+}
 
-ground_truth=None
-with open('./labels.txt') as f:
-    ground_truth=f.read().split('\n')[:-1]
 
 def load_image(image_path, image_size, batch_size):
+    with open('dataset/labels.txt') as f:
+        ground_truth=f.read().split('\n')[:-1]
     images = []
     filenames=[]
     labels=[]
@@ -159,7 +160,5 @@ def save_image(images,names,output_dir):
         img.save(output_dir + name)
 
 
-if __name__=='__main__':
-    pass
 
 
